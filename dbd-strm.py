@@ -686,18 +686,21 @@ class DbdStrmGenerator:
     async def run(self, per_page: int = 100, oldest_first: bool = False) -> None:
         if not await self.verify_connection():
             raise DbdAPIError("Cannot connect to seedbox, aborting.")
-
+    
         files = await self.fetch_files(per_page=per_page, oldest_first=oldest_first)
-
+    
         if not files:
-            logger.warning("⚠️ No files retrieved - no cleanup will be performed.")
-            logger.info("✅ Done (no changes)")
-            return
-
-        keep_normalized = await self.generate_strm_files(files)
+            logger.warning("⚠️ No files retrieved from Debrid-Link.")
+            # No files = we should remove ALL existing .strm files
+            keep_normalized: Set[str] = set()
+        else:
+            keep_normalized = await self.generate_strm_files(files)
+    
+        # Always run cleanup; if keep_normalized is empty, this deletes all .strm
         await self.cleanup_old_strm_files(keep_normalized)
-
+    
         logger.info("✅ Done")
+
 
 
 # ---------------------------------------------------------------------------
