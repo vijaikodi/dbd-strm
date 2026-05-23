@@ -206,6 +206,117 @@ class DbdAPI:
 
 
 # ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def fsync_dir(path: Path) -> None:
+    """
+    Open a directory and fsync it so the kernel flushes all pending metadata
+    changes (unlink / rmdir / creat) through the bind-mount to the host
+    filesystem immediately.
+    """
+    if not path.exists():
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            logger.debug(f"🔄 fsynced dir: {path}")
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.warning(f"⚠️ fsync({path}) failed: {e}")
+
+
+def force_delete_file(path: Path) -> bool:
+    """
+    Delete a single file and fsync its parent directory to flush the
+    unlink() through the bind-mount immediately.
+    Returns True on success.
+    """
+    try:
+        path.unlink(missing_ok=True)
+        logger.info(f"🗑️  Deleted file : {path}")
+        fsync_dir(path.parent)
+        return True
+    except OSError as exc:
+        logger.error(f"❌ Cannot delete {path}: {exc}")
+        return False
+
+
+def force_delete_dir(path: Path) -> bool:
+    """
+    Recursively delete *everything* inside a directory (all files regardless
+    of extension, then all sub-directories), then remove the directory itself.
+    Every removal is fsynced to the parent so changes are visible on the host
+    side of the bind-mount immediately.
+    Returns True if the directory no longer exists afterwards.
+    """
+    if not path.exists():
+        return True
+
+    if not path.is_dir():
+        return force_delete_file(path)
+
+    logger.info(f"🗑️  Force-deleting directory: {path}")
+
+    # Walk bottom-up so we can rmdir leaf directories first
+    for root, dirs, files in os.walk(str(path), topdown=False):
+        root_path = Path(root)
+
+        # Delete every file in this directory
+        for fname in files:
+            fpath = root_path / fname
+            try:
+                fpath.unlink(missing_ok=True)
+                logger.debug(f"  deleted file: {fpath}")
+            except OSError as e:
+                logger.warning(f"  ⚠️ Cannot delete {fpath}: {e}")
+
+        # fsync the directory after all its files are removed
+        fsync_dir(root_path)
+
+        # Remove sub-directories (they should be empty now)
+        for dname in dirs:
+            dpath = root_path / dname
+            try:
+                dpath.rmdir()
+                logger.debug(f"  removed subdir: {dpath}")
+                fsync_dir(root_path)
+            except OSError as e:
+                logger.warning(f"  ⚠️ Cannot rmdir {dpath}: {e}")
+
+    # Finally remove the top-level directory itself
+    try:
+        path.rmdir()
+        logger.info(f"🗑️  Removed directory  : {path}")
+        fsync_dir(path.parent)
+        return True
+    except OSError as e:
+        logger.warning(f"⚠️ Cannot remove top dir {path}: {e}")
+        return False
+
+
+def purge_dir_if_stale(path: Path) -> None:
+    """
+    Remove a directory and ALL its contents (strm, nfo, anything) if it
+    contains no .strm files at all.  This catches the case where only .nfo
+    files are left behind after .strm deletion.
+    After removal every parent directory change is fsynced.
+    """
+    if not path.is_dir():
+        return
+
+    strm_files = list(path.rglob("*.strm"))
+    if strm_files:
+        # Still has valid content – leave it alone
+        return
+
+    logger.info(f"🧹 Purging stale directory (no .strm files): {path}")
+    force_delete_dir(path)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -237,7 +348,8 @@ def create_nfo_file(
     release_date: Optional[str] = None,
 ) -> None:
     """
-    Create a minimal NFO file alongside the .strm to assist Jellyfin metadata scraping.
+    Create a minimal NFO file alongside the .strm to assist Jellyfin
+    metadata scraping.
     - Movie:   movie.nfo
     - Episode: <Show> - S01E01.nfo
     """
@@ -284,6 +396,7 @@ def create_nfo_file(
             f.write(nfo_content)
             f.flush()
             os.fsync(f.fileno())
+        fsync_dir(folder)
         logger.info(f"[NFO] Created NFO: {nfo_path}")
     except Exception as e:
         logger.error(f"[ERROR] Could not create NFO file: {e}")
@@ -294,30 +407,13 @@ def create_nfo_file(
 # ---------------------------------------------------------------------------
 
 class StrmManager:
-    """Create/update/delete .strm files and normalize paths."""
+    """Create / update / delete .strm files and normalise paths."""
 
     @staticmethod
     def normalize_path(path: str | Path) -> str:
         s = str(path).lower().replace("\\", "/").strip()
         s = re.sub(r"\s+", " ", s)
         return s
-
-    @staticmethod
-    def _fsync_dir(path: Path) -> None:
-        """
-        Open a directory and call fsync() on it so the kernel flushes all
-        pending metadata changes (unlink / rmdir / creat) through the
-        bind-mount to the host filesystem immediately.
-        """
-        try:
-            fd = os.open(str(path), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-                logger.debug(f"🔄 fsynced dir: {path}")
-            finally:
-                os.close(fd)
-        except OSError as e:
-            logger.warning(f"⚠️ fsync({path}) failed: {e}")
 
     @staticmethod
     def save_strm(
@@ -352,14 +448,12 @@ class StrmManager:
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            # Write then fsync file descriptor so data lands on host filesystem
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(url_text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            # Also fsync the parent directory so the new directory entry is
-            # visible on the host side of the bind-mount immediately.
-            StrmManager._fsync_dir(path.parent)
+            # Flush the new directory entry to the host
+            fsync_dir(path.parent)
             bump("written")
             logger.debug(f"📝 Written: {path}")
             return True
@@ -370,59 +464,56 @@ class StrmManager:
 
     @staticmethod
     def delete_strm(path: Path, dry_run: bool = False) -> bool:
+        """
+        Delete a single .strm file.
+        After deletion the parent directory is inspected:
+          • if it still has .strm files  → leave it alone
+          • if it has only .nfo files    → purge everything and rmdir
+          • if it is empty               → rmdir
+        Every change is fsynced so it is immediately visible on the host.
+        """
         if dry_run:
-            logger.info(f"🗑️ (dry-run) would delete {path}")
+            logger.info(f"🗑️  (dry-run) would delete {path}")
             return True
 
-        try:
-            path.unlink()
-            logger.info(f"🗑️ Deleted {path}")
-
-            parent = path.parent
-
-            # fsync parent directory so the unlink() is flushed to the host
-            # filesystem through the bind-mount right away.
-            StrmManager._fsync_dir(parent)
-
-            # Clean up parent folder if it only contains .nfo files or is empty
-            try:
-                items = list(parent.iterdir())
-
-                # If only NFO files remain, they are orphaned metadata – remove them
-                only_nfo_left = (
-                    len(items) > 0
-                    and all(i.is_file() and i.suffix.lower() == ".nfo" for i in items)
-                )
-                if only_nfo_left:
-                    for i in items:
-                        logger.info(f"🗑️ Deleting orphaned NFO: {i}")
-                        i.unlink()
-                        # fsync after each NFO removal
-                        StrmManager._fsync_dir(parent)
-                    items = []
-
-                # If the folder is now empty, remove it and fsync grandparent
-                if not items:
-                    grandparent = parent.parent
-                    parent.rmdir()
-                    logger.debug(f"📂 Removed empty folder: {parent}")
-                    StrmManager._fsync_dir(grandparent)
-
-            except OSError:
-                pass
-
-            return True
-
-        except OSError as exc:
-            logger.error(f"❌ Cannot delete {path}: {exc}")
+        if not force_delete_file(path):
             return False
+
+        parent = path.parent
+
+        # Re-check what remains in the parent after the deletion
+        try:
+            remaining = list(parent.iterdir())
+        except OSError:
+            return True
+
+        # Check if any .strm files still exist in this folder
+        remaining_strm = [f for f in remaining if f.suffix.lower() == ".strm"]
+
+        if remaining_strm:
+            # Other episodes / files still here – nothing more to do
+            return True
+
+        # No .strm left → purge the whole parent directory (catches .nfo leftovers)
+        # For TV shows this is a Season XX folder; for movies it is the title folder.
+        purge_dir_if_stale(parent)
+
+        # For TV shows: also check the show root (parent of Season XX)
+        # If all seasons are gone the show folder itself should be removed too.
+        grandparent = parent.parent
+        if grandparent.is_dir() and grandparent != path.parents[2]:
+            purge_dir_if_stale(grandparent)
+
+        return True
 
 
 # ---------------------------------------------------------------------------
 # Mapping Debrid files → Jellyfin paths
 # ---------------------------------------------------------------------------
 
-def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, Dict[str, Any]]:
+def map_dbd_file_to_target(
+    file: DbdFile, dest_base: Path
+) -> tuple[Path, str, Dict[str, Any]]:
     """
     Convert a Debrid file into (target_folder, target_basename, meta).
     target_basename is without extension; .strm will be appended by the caller.
@@ -582,7 +673,6 @@ class DbdStrmGenerator:
                 logger.warning(f"⚠️ No URL for {f.name}")
                 continue
 
-            # Write/update .strm with Debrid-Link URL
             self.strm_manager.save_strm(
                 full_path,
                 f.url,
@@ -590,27 +680,24 @@ class DbdStrmGenerator:
                 stats=stats,
             )
 
-            # Flush the new/updated file's parent directory to the host
-            if not self.dry_run:
-                self.strm_manager._fsync_dir(full_path.parent)
-
             # Create NFO (movie or episode)
-            if meta["type"] == "movie":
-                create_nfo_file(
-                    target_folder,
-                    meta["title"],
-                    year=meta["year"],
-                    release_date=meta["release_date"],
-                )
-            elif meta["type"] == "episode":
-                create_nfo_file(
-                    target_folder,
-                    meta["title"],
-                    year=meta["year"],
-                    season=meta["season"],
-                    episode_list=meta["episode_list"],
-                    release_date=meta["release_date"],
-                )
+            if not self.dry_run:
+                if meta["type"] == "movie":
+                    create_nfo_file(
+                        target_folder,
+                        meta["title"],
+                        year=meta["year"],
+                        release_date=meta["release_date"],
+                    )
+                elif meta["type"] == "episode":
+                    create_nfo_file(
+                        target_folder,
+                        meta["title"],
+                        year=meta["year"],
+                        season=meta["season"],
+                        episode_list=meta["episode_list"],
+                        release_date=meta["release_date"],
+                    )
 
             normalized_to_actual[key] = rel_path
             normalized_created.add(norm_full)
@@ -648,105 +735,51 @@ class DbdStrmGenerator:
             key = self.strm_manager.normalize_path(rel)
             if key in keep_normalized:
                 kept += 1
-                logger.debug(f"Kept: {rel}")
+                logger.debug(f"✅ Kept: {rel}")
             else:
                 to_delete.append(path)
-                logger.debug(f"To delete: {rel}")
+                logger.debug(f"🗑️  To delete: {rel}")
 
         logger.info(f"📊 {kept} files kept, {len(to_delete)} to delete")
 
         for path in to_delete:
             self.strm_manager.delete_strm(path, self.dry_run)
 
-        # Clean up any remaining empty or NFO-only folders after all deletions
+        # Final pass: purge any directory under movies/ or tvshows/ that has
+        # no .strm files left (catches stubborn .nfo-only or empty folders).
         if not self.dry_run:
-            self._cleanup_empty_folders()
+            self._final_purge_stale_dirs()
 
-    def _fsync_dir(self, path: Path) -> None:
+    def _final_purge_stale_dirs(self) -> None:
         """
-        Open a directory and call fsync() on it so the kernel flushes all
-        pending metadata changes (unlink / rmdir / creat) through the
-        bind-mount to the host filesystem immediately.
+        Walk every immediate child of movies/ and tvshows/.
+        Any subtree that contains zero .strm files is completely removed and
+        every removal is fsynced so it is instantly visible on the host.
         """
-        try:
-            fd = os.open(str(path), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-                logger.debug(f"🔄 fsynced dir: {path}")
-            finally:
-                os.close(fd)
-        except OSError as e:
-            logger.warning(f"⚠️ fsync({path}) failed: {e}")
+        logger.info("🔍 Final pass: purging stale directories…")
 
-    def _cleanup_empty_folders(self) -> None:
-        """
-        Recursively remove empty folders in the base directory.
-        Also removes folders that only contain .nfo files (orphaned metadata).
-        Fsyncs each parent directory after removal so changes are immediately
-        visible on the host side of the bind-mount.
-        """
-        logger.info("🔍 Cleaning up empty and orphaned folders…")
-
-        for media_type in ["movies", "tvshows"]:
-            media_dir = self.base_dir / media_type
-            if not media_dir.exists():
+        for media_root in ["movies", "tvshows"]:
+            media_dir = self.base_dir / media_root
+            if not media_dir.is_dir():
                 continue
-            self._cleanup_folder_recursive(media_dir)
 
-    def _cleanup_folder_recursive(self, folder: Path) -> bool:
-        """
-        Recursively clean a folder tree.
-        Returns True if *this* folder was removed so the caller can re-check
-        its own contents.
-        """
-        if not folder.is_dir():
-            return False
+            # For movies: children are title folders  (movies/<Title (Year)>/)
+            # For tvshows: children are show folders  (tvshows/<Show>/)
+            #              grandchildren are season folders
+            # We check at the show/title level so the whole tree is removed
+            # in one shot when nothing is left.
+            for child in sorted(media_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                strm_count = len(list(child.rglob("*.strm")))
+                if strm_count == 0:
+                    logger.info(
+                        f"🧹 No .strm files left under '{child.name}' – removing entire tree"
+                    )
+                    force_delete_dir(child)
 
-        try:
-            items = list(folder.iterdir())
-        except OSError as e:
-            logger.warning(f"⚠️ Cannot read directory {folder}: {e}")
-            return False
-
-        # Recurse into sub-directories first (depth-first)
-        for item in list(items):
-            if item.is_dir():
-                self._cleanup_folder_recursive(item)
-
-        # Re-scan after children may have been removed
-        try:
-            items = list(folder.iterdir())
-        except OSError:
-            return False
-
-        # Remove orphaned NFO-only folders
-        only_nfo = (
-            len(items) > 0
-            and all(i.is_file() and i.suffix.lower() == ".nfo" for i in items)
-        )
-        if only_nfo:
-            for i in items:
-                logger.info(f"🗑️ Deleting orphaned NFO: {i}")
-                try:
-                    i.unlink()
-                    self._fsync_dir(folder)
-                except OSError as e:
-                    logger.warning(f"⚠️ Cannot delete NFO {i}: {e}")
-            items = []
-
-        # Remove folder if now empty
-        if not items:
-            try:
-                parent = folder.parent
-                folder.rmdir()
-                logger.info(f"🗑️ Removed empty folder: {folder}")
-                # fsync parent so the rmdir is flushed to the host immediately
-                self._fsync_dir(parent)
-                return True
-            except OSError as e:
-                logger.warning(f"⚠️ Cannot remove empty folder {folder}: {e}")
-
-        return False
+            # After children are processed, fsync the media root itself
+            fsync_dir(media_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -766,8 +799,8 @@ async def run_once(target: Path, args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
         )
 
-        logger.info(f"📁 Output directory: {target}")
-        logger.info(f"🔑 API URL: {API_URL}")
+        logger.info(f"📁 Output directory : {target}")
+        logger.info(f"🔑 API URL          : {API_URL}")
 
         files = await generator.fetch_files(
             per_page=args.per_page,
@@ -791,20 +824,17 @@ async def amain() -> None:
     )
 
     parser.add_argument(
-        "-d",
-        "--dry-run",
+        "-d", "--dry-run",
         action="store_true",
         help="Simulate operations without writing/deleting files",
     )
     parser.add_argument(
-        "-v",
-        "--verbose",
+        "-v", "--verbose",
         action="store_true",
         help="Enable verbose mode",
     )
     parser.add_argument(
-        "-m",
-        "--min-size",
+        "-m", "--min-size",
         type=int,
         default=DEFAULT_MIN_SIZE,
         help="Minimum file size in bytes",
