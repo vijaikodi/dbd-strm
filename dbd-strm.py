@@ -8,7 +8,6 @@ import asyncio
 import logging
 import os
 import re
-import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -30,6 +29,7 @@ API_KEY: str = os.getenv("DBD_API_KEY") or ""
 API_URL: str = os.getenv("DBD_API_URL") or ""
 SDBX_ID: str = os.getenv("DBD_SDBX_ID") or ""
 
+# Rescan interval in minutes. 0 or negative → run once and exit.
 RESCAN_INTERVAL_MIN: int = int(os.getenv("DBD_SCAN_INTERVAL_MIN", "60"))
 
 DEFAULT_MIN_SIZE = 100 * 1024 * 1024  # 100 MiB
@@ -39,23 +39,14 @@ AUDIO_EXTS = {".mp3", ".flac", ".aac", ".m4a", ".ogg", ".wav"}
 
 logger = logging.getLogger(__name__)
 
-_shutdown_requested = False
-
 
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(levelname)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-
-
-def _handle_shutdown(signum, frame) -> None:
-    global _shutdown_requested
-    logger.warning(f"⚠️ Received signal {signum}, shutting down gracefully...")
-    _shutdown_requested = True
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +55,7 @@ def _handle_shutdown(signum, frame) -> None:
 
 @dataclass(frozen=True)
 class DbdFile:
+    """Represents a file on Debrid-Link."""
     id: str
     name: str
     url: str
@@ -77,17 +69,19 @@ class DbdFile:
 # ---------------------------------------------------------------------------
 
 class DbdAPIError(Exception):
-    pass
+    """Generic Debrid-Link API error."""
 
 
 class RateLimitError(DbdAPIError):
+    """Rate limit (floodDetected)."""
+
     def __init__(self, reset_after: int) -> None:
         self.reset_after = reset_after
         super().__init__(f"Rate limit reached, retry in ~{reset_after // 60} minutes")
 
 
 class SkipFile(Exception):
-    pass
+    """Raised when a file should be skipped during mapping."""
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +89,8 @@ class SkipFile(Exception):
 # ---------------------------------------------------------------------------
 
 class DbdAPI:
+    """Async client for Debrid-Link API."""
+
     def __init__(self, api_key: str, base_url: str, client: httpx.AsyncClient) -> None:
         if not api_key:
             raise ValueError("Missing API key")
@@ -104,6 +100,7 @@ class DbdAPI:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.client = client
+
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -117,6 +114,12 @@ class DbdAPI:
         timeout: float = 10.0,
         retries: int = 3,
     ) -> Optional[Dict[str, Any]]:
+        """
+        Perform a GET request on the API.
+
+        Returns JSON dict or None on non-blocking error.
+        Raises RateLimitError on floodDetected / 429.
+        """
         url = f"{self.base_url}{endpoint}"
 
         for attempt in range(1, retries + 1):
@@ -140,36 +143,45 @@ class DbdAPI:
                 err = data.get("error")
                 desc = data.get("error_description", "") or ""
 
+                # floodDetected / rate limit
                 if err == "floodDetected" or exc.response.status_code == 429:
                     logger.error(f"⚠️ floodDetected: {desc or 'API rate limit reached'}")
+                    # example uses 1 hour
                     raise RateLimitError(3600)
 
+                # 503 → retry
                 if exc.response.status_code == 503 and attempt < retries:
                     wait = 2 * attempt
-                    logger.warning(f"⏳ HTTP 503 on {url} – attempt {attempt}/{retries}, retry in {wait}s")
+                    logger.warning(
+                        f"⏳ HTTP 503 on {url} – attempt {attempt}/{retries}, retry in {wait}s"
+                    )
                     await asyncio.sleep(wait)
                     continue
 
-                logger.error(f"⚠️ HTTP {exc.response.status_code} on {url}: {desc or str(exc)}")
+                logger.error(
+                    f"⚠️ HTTP {exc.response.status_code} on {url}: {desc or str(exc)}"
+                )
                 return None
 
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                if attempt < retries:
-                    wait = 2 * attempt
-                    logger.warning(f"⏳ Network error on {url} – attempt {attempt}/{retries}, retry in {wait}s")
-                    await asyncio.sleep(wait)
-                    continue
-                raise
+            except httpx.RequestError as exc:
+                logger.error(f"⚠️ Network error to {url}: {exc}")
+                return None
 
         return None
 
     async def list_files(
         self,
+        folder_id: str,
         cur_path: str = "",
         *,
         per_page: int = 100,
         extra_params: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[DbdFile]:
+        """
+        Recursively list all files in a folder.
+
+        Uses pagination.next when available, otherwise per_page.
+        """
         page = 0
 
         while True:
@@ -177,52 +189,86 @@ class DbdAPI:
             if extra_params:
                 params.update(extra_params)
 
-            data = await self.get("/seedbox/list", params=params)
+            logger.debug(f"DEBUG: request page={page} folder_id={folder_id} params={params}")
 
+            data = await self.get(f"/files/{folder_id}/list", params=params)
             if not data or not data.get("success"):
-                logger.warning("⚠️ /seedbox/list returned no data or success=false")
+                logger.debug(
+                    f"DEBUG: no data or success=False (page={page}, folder={folder_id})"
+                )
                 break
 
-            items = data.get("value") or []
+            items = data.get("value", []) or []
+            logger.debug(f"DEBUG: received {len(items)} items (page {page})")
+
             if not items:
-                logger.debug("No items returned, stopping pagination.")
                 break
 
             for item in items:
-                name = item.get("name", "")
-                item_id = item.get("id", "")
-                size = int(item.get("size") or 0)
-                url = item.get("downloadUrl") or item.get("url") or ""
-                child_path = f"{cur_path}/{name}".lstrip("/") if cur_path else name
-
-                ext = Path(name).suffix.lower()
-                if ext in VIDEO_EXTS:
-                    media_type = "video"
-                elif ext in AUDIO_EXTS:
-                    media_type = "audio"
-                else:
-                    logger.debug(f"Skipping non-media file: {name}")
+                if not isinstance(item, dict):
                     continue
 
-                yield DbdFile(
-                    id=item_id,
-                    name=name,
-                    url=url,
-                    media_type=media_type,
-                    size=size,
-                    path=child_path,
-                )
+                item_type = item.get("type")
+                name = item.get("name", "")
+                id_ = item.get("id", "")
+                size = int(item.get("size", 0))
+                download_url = item.get("downloadUrl", "")
+                full_path = os.path.join(cur_path, name) if cur_path else name
 
+                if item_type == "file":
+                    ext = Path(name).suffix.lower()
+                    media_type = (
+                        "video"
+                        if ext in VIDEO_EXTS
+                        else "audio"
+                        if ext in AUDIO_EXTS
+                        else "unknown"
+                    )
+                    if media_type != "unknown":
+                        yield DbdFile(
+                            id=id_,
+                            name=name,
+                            url=download_url,
+                            media_type=media_type,
+                            size=size,
+                            path=full_path,
+                        )
+
+                elif item_type == "folder":
+                    # recurse
+                    async for subfile in self.list_files(
+                        id_,
+                        full_path,
+                        per_page=per_page,
+                        extra_params=extra_params,
+                    ):
+                        yield subfile
+
+                elif item_type == "movie":
+                    # Some APIs expose movies directly
+                    yield DbdFile(
+                        id=id_,
+                        name=name,
+                        url=download_url,
+                        media_type="video",
+                        size=size,
+                        path=full_path,
+                    )
+
+            # Pagination handling
             pagination = data.get("pagination") or {}
             next_page = pagination.get("next", -1)
 
-            logger.debug(f"DEBUG: pagination raw={pagination} page={page} next={next_page}")
+            logger.debug(
+                f"DEBUG: pagination raw={pagination} page={page} next={next_page}"
+            )
 
             if isinstance(next_page, int):
                 if next_page == -1:
                     break
                 page = next_page
             else:
+                # fallback: last page if fewer than per_page
                 if len(items) < per_page:
                     break
                 page += 1
@@ -231,10 +277,13 @@ class DbdAPI:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers adapted from rename_and_symlink.py
 # ---------------------------------------------------------------------------
 
 def clean_filename(filename: str) -> str:
+    """
+    Remove common release tags like 'www.something - ' from the beginning.
+    """
     cleaned = re.sub(
         r'^(?:\[\s*www\.[\w.-]+\s*\]|\(\s*www\.[\w.-]+\s*\)|www\.[\w.-]+)\s*-\s*',
         '',
@@ -247,55 +296,68 @@ def clean_filename(filename: str) -> str:
 def create_nfo_file(
     target_folder: Path,
     title: str,
-    year: Optional[int] = None,
-    season: Optional[int] = None,
+    year: int | str | None = None,
+    season: int | None = None,
     episode_list: Optional[List[int]] = None,
     release_date: Optional[str] = None,
 ) -> None:
-    target_folder.mkdir(parents=True, exist_ok=True)
+    """
+    Create a simple NFO file for Jellyfin.
+    If season+episode_list are provided → episodes; otherwise movie.
+    """
+    os.makedirs(target_folder, exist_ok=True)
 
     if season is not None and episode_list:
-        episode_str = "-".join(f"E{e:02}" for e in episode_list)
-        nfo_filename = f"{title} - S{season:02}{episode_str}.nfo"
-        nfo_path = target_folder / nfo_filename
+        # TV episodes
+        for episode in episode_list:
+            episode_str = f"E{episode:02}"
+            nfo_path = target_folder / f"{title} - S{season:02}{episode_str}.nfo"
 
-        nfo_content = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<episodedetails>
-  <title>{title}</title>
-  <season>{season}</season>
-  <episode>{episode_list[0]}</episode>
-  <aired>{release_date or ""}</aired>
-</episodedetails>
-"""
-        try:
-            if not nfo_path.exists():
+            # minimal content, adjust if needed
+            nfo_content = "\n"
+            nfo_content += "\n"
+            nfo_content += f"  {title}\n"
+            nfo_content += f"  {season}\n"
+            nfo_content += f"  {episode}\n"
+            if release_date or year:
+                date_to_use = release_date or f"{year}-01-01"
+                nfo_content += f"  {date_to_use}\n"
+            nfo_content += "\n"
+
+            try:
                 with open(nfo_path, "w", encoding="utf-8") as f:
                     f.write(nfo_content)
                 logger.info(f"[NFO] Created episode NFO: {nfo_path}")
-        except Exception as e:
-            logger.error(f"[ERROR] Could not create NFO file: {e}")
+            except Exception as e:
+                logger.error(f"[ERROR] Could not create NFO file: {e}")
     else:
-        year_str = f" ({year})" if year else ""
-        nfo_filename = f"{title}{year_str}.nfo"
-        nfo_path = target_folder / nfo_filename
+        # Movie
+        year_str = str(year) if year else ""
+        nfo_path = target_folder / f"{title} ({year_str}).nfo"
 
-        nfo_content = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<movie>
-  <title>{title}</title>
-  <year>{year or ""}</year>
-  <premiered>{release_date or ""}</premiered>
-</movie>
-"""
+        nfo_content = "\n"
+        nfo_content += "\n"
+        nfo_content += f"  {title}\n"
+        if year:
+            nfo_content += f"  {year}\n"
+        if release_date or year:
+            date_to_use = release_date or f"{year}-01-01"
+            nfo_content += f"  {date_to_use}\n"
+            nfo_content += f"  {date_to_use}\n"
+        nfo_content += "\n"
+
         try:
-            if not nfo_path.exists():
-                with open(nfo_path, "w", encoding="utf-8") as f:
-                    f.write(nfo_content)
-                logger.info(f"[NFO] Created movie NFO: {nfo_path}")
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write(nfo_content)
+            logger.info(f"[NFO] Created movie NFO: {nfo_path}")
         except Exception as e:
             logger.error(f"[ERROR] Could not create NFO file: {e}")
 
 
 def extract_release_date(info: dict) -> str:
+    """
+    Try to extract release date from guessit info or use current date.
+    """
     date_val = info.get("date")
     if date_val:
         return str(date_val)
@@ -307,6 +369,8 @@ def extract_release_date(info: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class StrmManager:
+    """Create/update/delete .strm files and normalize paths."""
+
     @staticmethod
     def normalize_path(path: str | Path) -> str:
         s = str(path).lower().replace("\\", "/").strip()
@@ -317,51 +381,59 @@ class StrmManager:
     def save_strm(
         path: Path,
         url: str,
-        dry_run: bool,
-        stats: Dict[str, int],
+        dry_run: bool = False,
+        stats: Optional[Dict[str, int]] = None,
     ) -> bool:
+        def bump(key: str) -> None:
+            if stats is not None:
+                stats[key] = stats.get(key, 0) + 1
+
+        url_text = url.strip()
         try:
-            if path.exists():
-                existing = path.read_text(encoding="utf-8").strip()
-                if existing == url.strip():
-                    stats["skipped"] = stats.get("skipped", 0) + 1
-                    return True
+            existing = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            existing = None
+        except OSError as exc:
+            logger.warning(f"⚠️ Cannot read {path}: {exc}")
+            existing = None
 
-            if dry_run:
-                logger.info(f"📝 (dry-run) Would write: {path}")
-                stats["dry_run"] = stats.get("dry_run", 0) + 1
-                return True
-
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(url, encoding="utf-8")
-
-            try:
-                with open(path, "rb") as fh:
-                    os.fsync(fh.fileno())
-            except OSError:
-                pass
-
-            logger.info(f"✅ Wrote {path}")
-            stats["written"] = stats.get("written", 0) + 1
+        if existing is not None and existing.strip() == url_text:
+            bump("skipped")
+            logger.debug(f"✅ Up to date: {path}")
             return True
 
+        if dry_run:
+            bump("dry_run")
+            logger.info(f"📝 (dry-run) {path}")
+            return True
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(url_text, encoding="utf-8")
+            bump("written")
+            logger.debug(f"📝 {path}")
+            return True
         except OSError as exc:
+            bump("errors")
             logger.error(f"❌ Cannot write {path}: {exc}")
-            stats["errors"] = stats.get("errors", 0) + 1
             return False
 
     @staticmethod
-    def delete_strm(path: Path, dry_run: bool) -> bool:
+    def delete_strm(path: Path, dry_run: bool = False) -> bool:
         if dry_run:
-            logger.info(f"🗑️ (dry-run) Would delete: {path}")
+            logger.info(f"🗑️ (dry-run) {path}")
             return True
+
         try:
             path.unlink()
             logger.info(f"🗑️ Deleted {path}")
-
+            
+            # Clean up parent folder if it only contains .nfo files or is empty
             parent = path.parent
             try:
                 items = list(parent.iterdir())
+
+                # If only NFO files remain, delete them as orphaned metadata
                 only_nfo_left = (
                     len(items) > 0
                     and all(i.is_file() and i.suffix.lower() == ".nfo" for i in items)
@@ -372,11 +444,15 @@ class StrmManager:
                         i.unlink()
                     items = []
 
+                # If folder is now empty, remove it
+                # Note: We only remove the immediate parent here.
+                # The full recursive cleanup happens in _cleanup_empty_folders()
                 if not items:
                     parent.rmdir()
                     logger.debug(f"📂 Removed empty folder: {parent}")
 
             except OSError:
+                # ignore if we can't inspect or remove
                 pass
 
             return True
@@ -386,10 +462,15 @@ class StrmManager:
 
 
 # ---------------------------------------------------------------------------
-# Mapping Debrid files → Jellyfin paths
+# Mapping Debrid files → Jellyfin paths (logic from rename_and_symlink)
 # ---------------------------------------------------------------------------
 
 def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, Dict[str, Any]]:
+    """
+    Convert a Debrid file into (target_folder, target_basename, meta).
+    target_basename is without extension; .strm will be added.
+    """
+    # Use logical path inside Debrid-Link
     filename = Path(file.path).name or file.name
     cleaned_name = clean_filename(filename)
     info = guessit(cleaned_name)
@@ -415,9 +496,12 @@ def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, D
         return target_folder, target_name, meta
 
     if info.get("type") == "episode":
+        # Derive show title:
+        # if path has a parent folder, use its name (cleaned), otherwise guessit title
         parent_name = Path(file.path).parent.name
         if parent_name:
             title = clean_filename(parent_name)
+            # remove common patterns like "S01 - EP(01-09)" and "(2023)"
             title = re.sub(r"\s*S\d{2}\s*-\s*EP\([^)]+\).*$", "", title, flags=re.IGNORECASE)
             title = re.sub(r"\s*\(\d{4}\).*$", "", title)
             title = title.strip()
@@ -430,10 +514,11 @@ def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, D
         season = info.get("season")
         episode = info.get("episode")
 
-        if isinstance(season, list) and season:
+        # Normalize season/episode
+        if isinstance(season, List) and season:
             season = season[0]
 
-        if isinstance(episode, list) and episode:
+        if isinstance(episode, List) and episode:
             episode_list = episode
         elif isinstance(episode, int):
             episode_list = [episode]
@@ -456,6 +541,7 @@ def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, D
         }
         return target_folder, target_name, meta
 
+    # Other media types can be skipped
     raise SkipFile(f"Unsupported media type for: {filename}")
 
 
@@ -480,32 +566,42 @@ class DbdStrmGenerator:
         self.strm_manager = StrmManager()
 
     async def verify_connection(self) -> bool:
-        logger.info("🔗 Verifying connection to Debrid-Link...")
-        data = await self.api.get("/account/infos")
-        if data and data.get("success"):
-            logger.info("✅ Connection OK")
-            return True
-        logger.error("❌ Connection failed")
-        return False
+        """Simple connection test."""
+        data = await self.api.get(
+            f"/files/{self.sdbx_id}/list", params={"page": 0, "perPage": 1}
+        )
+        if not data or not data.get("success"):
+            logger.error("❌ Cannot fetch seedbox list (connection test)")
+            return False
+        return True
 
-    async def fetch_files(self, per_page: int = 100, oldest_first: bool = False) -> List[DbdFile]:
-        logger.info("📂 Fetching files from Debrid-Link seedbox...")
+    async def fetch_files(
+        self,
+        per_page: int = 100,
+        oldest_first: bool = False,
+    ) -> List[DbdFile]:
+        extra_params: Dict[str, Any] = {}
+        if oldest_first:
+            extra_params["order"] = "asc"
+            logger.debug("DEBUG: sorting by oldest (order=asc)")
+
+        logger.info("🔗 Querying Debrid-Link…")
+
         files: List[DbdFile] = []
-        extra = {"order": "asc"} if oldest_first else None
+        async for f in self.api.list_files(
+            self.sdbx_id,
+            per_page=per_page,
+            extra_params=extra_params,
+        ):
+            if f.size >= self.min_size:
+                files.append(f)
 
-        async for f in self.api.list_files(per_page=per_page, extra_params=extra):
-            if f.size < self.min_size:
-                logger.debug(f"Skip (too small): {f.name} ({f.size} bytes)")
-                continue
-            files.append(f)
-
-        logger.info(f"📦 {len(files)} files retrieved")
+        logger.info(f"📊 {len(files)} eligible files (≥ {self.min_size} bytes)")
         return files
 
     async def generate_strm_files(self, files: List[DbdFile]) -> Set[str]:
-        logger.info("🛠️ Generating .strm files...")
-        normalized_to_actual: Dict[str, Path] = {}
         normalized_created: Set[str] = set()
+        normalized_to_actual: Dict[str, Path] = {}
         stats: Dict[str, int] = {"written": 0, "skipped": 0, "errors": 0, "dry_run": 0}
 
         for f in files:
@@ -517,8 +613,8 @@ class DbdStrmGenerator:
 
             full_path = target_folder / f"{target_name}.strm"
             rel_path = full_path.relative_to(self.base_dir)
-            key = self.strm_manager.normalize_path(rel_path)
 
+            key = self.strm_manager.normalize_path(rel_path)
             existing = normalized_to_actual.get(key)
             if existing and str(existing) != str(rel_path):
                 logger.warning(f"⚠️ Path conflict: '{rel_path}' ↔ '{existing}'")
@@ -535,8 +631,15 @@ class DbdStrmGenerator:
                 logger.warning(f"⚠️ No URL for {f.name}")
                 continue
 
-            self.strm_manager.save_strm(full_path, f.url, self.dry_run, stats=stats)
+            # Write/update .strm with Debrid-Link URL
+            self.strm_manager.save_strm(
+                full_path,
+                f.url,
+                self.dry_run,
+                stats=stats,
+            )
 
+            # Create NFO (movie or episode)
             if meta["type"] == "movie":
                 create_nfo_file(
                     target_folder,
@@ -560,18 +663,23 @@ class DbdStrmGenerator:
         if self.dry_run:
             logger.info(
                 "📝 (dry-run) .strm: %d to write, %d already up to date, %d errors",
-                stats["dry_run"], stats["skipped"], stats["errors"],
+                stats["dry_run"],
+                stats["skipped"],
+                stats["errors"],
             )
         else:
             logger.info(
                 "📝 .strm: %d written/updated, %d already up to date, %d errors",
-                stats["written"], stats["skipped"], stats["errors"],
+                stats["written"],
+                stats["skipped"],
+                stats["errors"],
             )
 
         return {self.strm_manager.normalize_path(p) for p in normalized_to_actual.values()}
 
     async def cleanup_old_strm_files(self, keep_normalized: Set[str]) -> None:
         logger.info("🔍 Searching for obsolete .strm files…")
+
         existing = list(self.base_dir.glob("**/*.strm"))
         to_delete: List[Path] = []
         kept = 0
@@ -595,33 +703,41 @@ class DbdStrmGenerator:
         for path in to_delete:
             self.strm_manager.delete_strm(path, self.dry_run)
 
+        # Clean up orphaned folders after all deletions
         if not self.dry_run:
             self._cleanup_empty_folders()
-            try:
-                os.sync()
-                logger.debug("💾 Filesystem synced")
-            except Exception:
-                pass
 
     def _cleanup_empty_folders(self) -> None:
+        """
+        Recursively remove empty folders in the base directory.
+        Also removes folders that only contain .nfo files (orphaned metadata).
+        """
         logger.info("🔍 Cleaning up empty and orphaned folders…")
+        
+        # Process both movies and tvshows directories
         for media_type in ["movies", "tvshows"]:
             media_dir = self.base_dir / media_type
             if not media_dir.exists():
                 continue
+            
             self._cleanup_folder_recursive(media_dir)
 
     def _cleanup_folder_recursive(self, folder: Path) -> bool:
+        """
+        Recursively clean up a folder and its subfolders.
+        Returns True if the folder should be deleted (is empty or only has orphaned files).
+        """
         if not folder.is_dir():
             return False
-
+        
         try:
             items = list(folder.iterdir())
         except OSError as e:
             logger.warning(f"⚠️ Cannot read directory {folder}: {e}")
             return False
-
+        
         if not items:
+            # Folder is already empty
             try:
                 folder.rmdir()
                 logger.info(f"🗑️ Removed empty folder: {folder}")
@@ -629,40 +745,49 @@ class DbdStrmGenerator:
             except OSError as e:
                 logger.warning(f"⚠️ Cannot remove empty folder {folder}: {e}")
                 return False
-
-        subfolders = [item for item in items if item.is_dir()]
-        for subfolder in subfolders:
+        
+        # First, recursively process subfolders
+        subfolders_to_check = [item for item in items if item.is_dir()]
+        for subfolder in subfolders_to_check:
             self._cleanup_folder_recursive(subfolder)
-
+        
+        # Re-check items after recursive cleanup
         try:
             items = list(folder.iterdir())
         except OSError:
             return False
-
+        
         if not items:
+            # Folder became empty after recursive cleanup
             try:
                 folder.rmdir()
                 logger.info(f"🗑️ Removed empty folder: {folder}")
                 return True
             except OSError as e:
-                logger.warning(f"⚠️ Cannot remove folder {folder}: {e}")
+                logger.warning(f"⚠️ Cannot remove empty folder {folder}: {e}")
                 return False
-
-        only_nfo = all(i.is_file() and i.suffix.lower() == ".nfo" for i in items)
+        
+        # Check if only .nfo files remain (orphaned metadata)
+        only_nfo = all(item.is_file() and item.suffix.lower() == ".nfo" for item in items)
+        
         if only_nfo:
-            for i in items:
+            logger.info(f"🗑️ Found folder with only orphaned .nfo files: {folder}")
+            for item in items:
                 try:
-                    i.unlink()
-                    logger.info(f"🗑️ Deleted orphaned NFO: {i}")
-                except OSError:
-                    pass
+                    item.unlink()
+                    logger.info(f"🗑️ Deleted orphaned NFO: {item}")
+                except OSError as e:
+                    logger.warning(f"⚠️ Cannot delete {item}: {e}")
+            
+            # Try to remove the folder after deleting .nfo files
             try:
                 folder.rmdir()
-                logger.info(f"🗑️ Removed orphaned folder: {folder}")
+                logger.info(f"🗑️ Removed folder after cleaning orphaned metadata: {folder}")
                 return True
-            except OSError:
+            except OSError as e:
+                logger.warning(f"⚠️ Cannot remove folder {folder}: {e}")
                 return False
-
+        
         return False
 
     async def run(self, per_page: int = 100, oldest_first: bool = False) -> None:
@@ -673,12 +798,15 @@ class DbdStrmGenerator:
 
         if not files:
             logger.warning("⚠️ No files retrieved from Debrid-Link.")
+            # No files = we should remove ALL existing .strm files
             keep_normalized: Set[str] = set()
         else:
             keep_normalized = await self.generate_strm_files(files)
 
+        # Always run cleanup; if keep_normalized is empty, this deletes all .strm
         await self.cleanup_old_strm_files(keep_normalized)
-        logger.info("✅ Scan complete")
+
+        logger.info("✅ Done")
 
 
 # ---------------------------------------------------------------------------
@@ -703,25 +831,56 @@ async def amain() -> None:
         description="Generate .strm files from Debrid-Link using Jellyfin-style naming",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("-d", "--dry-run", action="store_true",
-                        help="Simulate operations without writing/deleting files")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode")
-    parser.add_argument("-m", "--min-size", type=int, default=DEFAULT_MIN_SIZE,
-                        help="Minimum file size in bytes")
-    parser.add_argument("--per-page", type=int, default=100, help="Number of items per page in API")
-    parser.add_argument("--oldest", action="store_true", help="Process oldest files first")
-    parser.add_argument("target", type=Path, nargs="?", default=Path.cwd(),
-                        help="Root directory where .strm files will be created/updated")
+
+    parser.add_argument(
+        "-d",
+        "--dry-run",
+        action="store_true",
+        help="Simulate operations without writing/deleting files",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose mode",
+    )
+    parser.add_argument(
+        "-m",
+        "--min-size",
+        type=int,
+        default=DEFAULT_MIN_SIZE,
+        help="Minimum file size in bytes",
+    )
+    parser.add_argument(
+        "--per-page",
+        type=int,
+        default=100,
+        help="Number of items per page in API",
+    )
+    parser.add_argument(
+        "--oldest",
+        action="store_true",
+        help="Process oldest files first",
+    )
+    parser.add_argument(
+        "target",
+        type=Path,
+        nargs="?",
+        default=Path.cwd(),
+        help="Root directory where .strm files will be created/updated",
+    )
 
     args = parser.parse_args()
     setup_logging(args.verbose)
 
     missing = [
-        name for name, val in [
+        name
+        for name, val in [
             ("DBD_API_KEY", API_KEY),
             ("DBD_API_URL", API_URL),
             ("DBD_SDBX_ID", SDBX_ID),
-        ] if not val
+        ]
+        if not val
     ]
     if missing:
         logger.error(f"❌ Missing environment variables: {', '.join(missing)}")
@@ -731,56 +890,36 @@ async def amain() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main: run once, sleep, then exit (Docker restart policy re-launches container)
+# Main loop with time.sleep()
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
-
-    exit_code = 0
-
-    try:
-        logger.info("🚀 Starting Debrid-Link STRM scan...")
-        asyncio.run(amain())
-        logger.info("✅ Scan finished successfully.")
-
-    except RateLimitError as e:
-        logger.error(f"❌ {e}")
-        exit_code = 0
-    except DbdAPIError as e:
-        logger.error(f"❌ {e}")
-        exit_code = 1
-    except (httpx.ConnectError, httpx.TimeoutException):
-        logger.error(f"❌ Critical network error: cannot reach {API_URL}")
-        logger.error("  Check your internet connection and API URL")
-        exit_code = 1
-    except KeyboardInterrupt:
-        logger.warning("⚠️ Interrupted")
-        sys.exit(130)
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
-        exit_code = 1
-
-    if RESCAN_INTERVAL_MIN <= 0:
-        logger.info("👋 One-shot mode (DBD_SCAN_INTERVAL_MIN <= 0), exiting now.")
-        sys.exit(exit_code)
-
-    logger.info(f"⏲️ Sleeping {RESCAN_INTERVAL_MIN} minutes before container restart...")
-
-    sleep_seconds = RESCAN_INTERVAL_MIN * 60
-    for _ in range(sleep_seconds):
-        if _shutdown_requested:
-            logger.info("👋 Shutdown requested during sleep, exiting now.")
-            sys.exit(0)
+    while True:
         try:
-            time.sleep(1)
+            asyncio.run(amain())
+        except RateLimitError as e:
+            logger.error(f"❌ {e}")
+        except DbdAPIError as e:
+            logger.error(f"❌ {e}")
+        except (httpx.ConnectError, httpx.TimeoutException):
+            logger.error(f"❌ Critical network error: cannot reach {API_URL}")
+            logger.error("  Check your internet connection and API URL")
         except KeyboardInterrupt:
-            logger.warning("⚠️ Interrupted during sleep")
+            logger.warning("\n⚠️ Interrupted")
             sys.exit(130)
 
-    logger.info("🔄 Sleep complete. Exiting container so Docker can restart it...")
-    sys.exit(exit_code)
+        # If interval <= 0, run once and exit
+        if RESCAN_INTERVAL_MIN <= 0:
+            break
+
+        logger.info(
+            f"⏲️ Sleeping {RESCAN_INTERVAL_MIN} minutes before next scan..."
+        )
+        try:
+            time.sleep(RESCAN_INTERVAL_MIN * 60)
+        except KeyboardInterrupt:
+            logger.warning("\n⚠️ Interrupted during sleep")
+            sys.exit(130)
 
 
 if __name__ == "__main__":
