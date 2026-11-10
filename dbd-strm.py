@@ -96,56 +96,124 @@ class DbdAPI:
             raise ValueError("Missing API key")
         if not base_url:
             raise ValueError("Missing API base URL")
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
-        self._client = client
 
-    async def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        url = f"{self._base_url}{endpoint}"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
-        try:
-            response = await self._client.get(url, headers=headers, params=params or {})
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as exc:
-            raise DbdAPIError(f"HTTP {exc.response.status_code} for {url}") from exc
-        except httpx.RequestError as exc:
-            raise DbdAPIError(f"Request error for {url}: {exc}") from exc
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.client = client
 
-        if not data.get("success", True):
-            error = data.get("error", "unknown")
-            if error == "floodDetected":
-                reset_after = int(data.get("reset_after", 3600))
-                raise RateLimitError(reset_after)
-            raise DbdAPIError(f"API error: {error}")
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-        return data
+    async def get(
+        self,
+        endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: float = 10.0,
+        retries: int = 3,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Perform a GET request on the API.
+
+        Returns JSON dict or None on non-blocking error.
+        Raises RateLimitError on floodDetected / 429.
+        """
+        url = f"{self.base_url}{endpoint}"
+
+        for attempt in range(1, retries + 1):
+            try:
+                resp = await self.client.get(
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+            except httpx.HTTPStatusError as exc:
+                data: Dict[str, Any] = {}
+                try:
+                    data = exc.response.json()
+                except ValueError:
+                    pass
+
+                err = data.get("error")
+                desc = data.get("error_description", "") or ""
+
+                # floodDetected / rate limit
+                if err == "floodDetected" or exc.response.status_code == 429:
+                    logger.error(f"⚠️ floodDetected: {desc or 'API rate limit reached'}")
+                    # example uses 1 hour
+                    raise RateLimitError(3600)
+
+                # 503 → retry
+                if exc.response.status_code == 503 and attempt < retries:
+                    wait = 2 * attempt
+                    logger.warning(
+                        f"⏳ HTTP 503 on {url} – attempt {attempt}/{retries}, retry in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                logger.error(
+                    f"⚠️ HTTP {exc.response.status_code} on {url}: {desc or str(exc)}"
+                )
+                return None
+
+            except httpx.RequestError as exc:
+                logger.error(f"⚠️ Network error to {url}: {exc}")
+                return None
+
+        return None
 
     async def list_files(
         self,
         folder_id: str,
-        base_path: str = "",
+        cur_path: str = "",
+        *,
         per_page: int = 100,
         extra_params: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[DbdFile]:
+        """
+        Recursively list all files in a folder.
+
+        Uses pagination.next when available, otherwise per_page.
+        """
         page = 0
+
         while True:
             params: Dict[str, Any] = {"page": page, "perPage": per_page}
             if extra_params:
                 params.update(extra_params)
 
-            data = await self.get(f"/files/{folder_id}/list", params=params)
-            items = data.get("value", [])
+            logger.debug(f"DEBUG: request page={page} folder_id={folder_id} params={params}")
 
-            logger.debug(f"DEBUG: folder={folder_id} page={page} items={len(items)}")
+            data = await self.get(f"/files/{folder_id}/list", params=params)
+            if not data or not data.get("success"):
+                logger.debug(
+                    f"DEBUG: no data or success=False (page={page}, folder={folder_id})"
+                )
+                break
+
+            items = data.get("value", []) or []
+            logger.debug(f"DEBUG: received {len(items)} items (page {page})")
+
+            if not items:
+                break
 
             for item in items:
-                id_ = item.get("id", "")
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type")
                 name = item.get("name", "")
-                size = item.get("size", 0)
-                download_url = item.get("downloadUrl", "") or item.get("url", "")
-                item_type = item.get("type", "file")
-                full_path = f"{base_path}/{name}".lstrip("/") if base_path else name
+                id_ = item.get("id", "")
+                size = int(item.get("size", 0))
+                download_url = item.get("downloadUrl", "")
+                full_path = os.path.join(cur_path, name) if cur_path else name
 
                 if item_type == "file":
                     ext = Path(name).suffix.lower()
@@ -167,6 +235,7 @@ class DbdAPI:
                         )
 
                 elif item_type == "folder":
+                    # recurse
                     async for subfile in self.list_files(
                         id_,
                         full_path,
@@ -176,6 +245,7 @@ class DbdAPI:
                         yield subfile
 
                 elif item_type == "movie":
+                    # Some APIs expose movies directly
                     yield DbdFile(
                         id=id_,
                         name=name,
@@ -198,6 +268,7 @@ class DbdAPI:
                     break
                 page = next_page
             else:
+                # fallback: last page if fewer than per_page
                 if len(items) < per_page:
                     break
                 page += 1
@@ -206,200 +277,121 @@ class DbdAPI:
 
 
 # ---------------------------------------------------------------------------
-# Filesystem helpers
-# ---------------------------------------------------------------------------
-
-def fsync_dir(path: Path) -> None:
-    """
-    Open a directory and fsync it so the kernel flushes all pending metadata
-    changes (unlink / rmdir / creat) through the bind-mount to the host
-    filesystem immediately.
-    """
-    if not path.exists():
-        return
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-            logger.debug(f"🔄 fsynced dir: {path}")
-        finally:
-            os.close(fd)
-    except OSError as e:
-        logger.warning(f"⚠️ fsync({path}) failed: {e}")
-
-
-def force_delete_file(path: Path) -> bool:
-    """
-    Delete a single file and fsync its parent directory to flush the
-    unlink() through the bind-mount immediately.
-    Returns True on success.
-    """
-    try:
-        path.unlink(missing_ok=True)
-        logger.info(f"🗑️  Deleted file : {path}")
-        fsync_dir(path.parent)
-        return True
-    except OSError as exc:
-        logger.error(f"❌ Cannot delete {path}: {exc}")
-        return False
-
-
-def force_delete_dir(path: Path) -> bool:
-    """
-    Recursively delete *everything* inside a directory (all files regardless
-    of extension, then all sub-directories), then remove the directory itself.
-    Every removal is fsynced to the parent so changes are visible on the host
-    side of the bind-mount immediately.
-    Returns True if the directory no longer exists afterwards.
-    """
-    if not path.exists():
-        return True
-
-    if not path.is_dir():
-        return force_delete_file(path)
-
-    logger.info(f"🗑️  Force-deleting directory: {path}")
-
-    # Walk bottom-up so we can rmdir leaf directories first
-    for root, dirs, files in os.walk(str(path), topdown=False):
-        root_path = Path(root)
-
-        # Delete every file in this directory
-        for fname in files:
-            fpath = root_path / fname
-            try:
-                fpath.unlink(missing_ok=True)
-                logger.debug(f"  deleted file: {fpath}")
-            except OSError as e:
-                logger.warning(f"  ⚠️ Cannot delete {fpath}: {e}")
-
-        # fsync the directory after all its files are removed
-        fsync_dir(root_path)
-
-        # Remove sub-directories (they should be empty now)
-        for dname in dirs:
-            dpath = root_path / dname
-            try:
-                dpath.rmdir()
-                logger.debug(f"  removed subdir: {dpath}")
-                fsync_dir(root_path)
-            except OSError as e:
-                logger.warning(f"  ⚠️ Cannot rmdir {dpath}: {e}")
-
-    # Finally remove the top-level directory itself
-    try:
-        path.rmdir()
-        logger.info(f"🗑️  Removed directory  : {path}")
-        fsync_dir(path.parent)
-        return True
-    except OSError as e:
-        logger.warning(f"⚠️ Cannot remove top dir {path}: {e}")
-        return False
-
-
-def purge_dir_if_stale(path: Path) -> None:
-    """
-    Remove a directory and ALL its contents (strm, nfo, anything) if it
-    contains no .strm files at all.  This catches the case where only .nfo
-    files are left behind after .strm deletion.
-    After removal every parent directory change is fsynced.
-    """
-    if not path.is_dir():
-        return
-
-    strm_files = list(path.rglob("*.strm"))
-    if strm_files:
-        # Still has valid content – leave it alone
-        return
-
-    logger.info(f"🧹 Purging stale directory (no .strm files): {path}")
-    force_delete_dir(path)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
+# Helpers adapted from rename_and_symlink.py
 # ---------------------------------------------------------------------------
 
 def clean_filename(filename: str) -> str:
-    """Remove common release tags like 'www.something - ' from the beginning."""
-    cleaned = re.sub(
-        r'^(?:\[\s*www\.[\w.-]+\s*\]|\(\s*www\.[\w.-]+\s*\)|www\.[\w.-]+)\s*-\s*',
-        '',
-        filename,
-        flags=re.IGNORECASE,
-    )
+    """Remove leading release-site tags and normalize the filename spacing."""
+    cleaned = filename.strip()
+    # Repeated site prefixes are sometimes stacked before the actual title.
+    while True:
+        without_bracketed_site = re.sub(
+            r'^\[\s*(?:(?:www\.)?[\w-]+(?:\.[a-z]{2,10})?|www\.[\w.-]+)\s*\]\s*(?:[-–:]\s*)?',
+            '', cleaned, count=1, flags=re.IGNORECASE,
+        )
+        if without_bracketed_site != cleaned:
+            cleaned = without_bracketed_site.lstrip()
+            continue
+        without_domain = re.sub(
+            r'^(?:www\.)?[\w-]+\.[a-z]{2,10}\s*[-–:]\s*',
+            '', cleaned, count=1, flags=re.IGNORECASE,
+        )
+        if without_domain != cleaned:
+            cleaned = without_domain.lstrip()
+            continue
+        break
     return cleaned.strip()
 
 
-def extract_release_date(info: dict) -> str:
-    """Try to extract release date from guessit info or use current date."""
-    date_val = info.get("date")
-    if date_val:
-        return str(date_val)
-    return datetime.now().strftime("%Y-%m-%d")
+def _episode_fallback(filename: str) -> Dict[str, Any]:
+    """Extract basic episode fields when guessit cannot parse a release name."""
+    stem = Path(filename).stem
+    episode_match = re.search(r'(?i)\bS(\d{1,2})E(\d{1,3})\b', stem)
+    year_match = re.search(r'\((19\d{2}|20\d{2})\)', stem)
+    title_end = len(stem)
+    if year_match:
+        title_end = min(title_end, year_match.start())
+    if episode_match:
+        title_end = min(title_end, episode_match.start())
+    title = re.sub(r'[._-]+', ' ', stem[:title_end]).strip(' ._-')
+    return {
+        'type': 'episode' if episode_match else None,
+        'title': title or None,
+        'year': int(year_match.group(1)) if year_match else None,
+        'season': int(episode_match.group(1)) if episode_match else None,
+        'episode': int(episode_match.group(2)) if episode_match else None,
+    }
 
 
 def create_nfo_file(
-    folder: Path,
+    target_folder: Path,
     title: str,
-    year: Optional[int] = None,
-    season: Optional[int] = None,
+    year: int | str | None = None,
+    season: int | None = None,
     episode_list: Optional[List[int]] = None,
     release_date: Optional[str] = None,
 ) -> None:
     """
-    Create a minimal NFO file alongside the .strm to assist Jellyfin
-    metadata scraping.
-    - Movie:   movie.nfo
-    - Episode: <Show> - S01E01.nfo
+    Create a simple NFO file for Jellyfin.
+    If season+episode_list are provided → episodes; otherwise movie.
     """
+    os.makedirs(target_folder, exist_ok=True)
+
     if season is not None and episode_list:
-        episode_str = "-".join(f"E{e:02}" for e in episode_list)
-        nfo_filename = f"{title} - S{season:02}{episode_str}.nfo"
-        nfo_path = folder / nfo_filename
+        # TV episodes
+        for episode in episode_list:
+            episode_str = f"E{episode:02}"
+            nfo_path = target_folder / f"{title} - S{season:02}{episode_str}.nfo"
 
-        if nfo_path.exists():
-            return
+            # minimal content, adjust if needed
+            nfo_content = "\n"
+            nfo_content += "\n"
+            nfo_content += f"  {title}\n"
+            nfo_content += f"  {season}\n"
+            nfo_content += f"  {episode}\n"
+            if release_date or year:
+                date_to_use = release_date or f"{year}-01-01"
+                nfo_content += f"  {date_to_use}\n"
+            nfo_content += "\n"
 
-        nfo_content = '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
-        nfo_content += "<episodedetails>\n"
-        nfo_content += f"  <title>{title}</title>\n"
-        nfo_content += f"  <season>{season}</season>\n"
-        for ep in episode_list:
-            nfo_content += f"  <episode>{ep}</episode>\n"
-        if release_date or year:
-            date_to_use = release_date or f"{year}-01-01"
-            nfo_content += f"  <aired>{date_to_use}</aired>\n"
-            nfo_content += f"  <premiered>{date_to_use}</premiered>\n"
-        nfo_content += "</episodedetails>\n"
+            try:
+                with open(nfo_path, "w", encoding="utf-8") as f:
+                    f.write(nfo_content)
+                logger.info(f"[NFO] Created episode NFO: {nfo_path}")
+            except Exception as e:
+                logger.error(f"[ERROR] Could not create NFO file: {e}")
     else:
-        nfo_filename = "movie.nfo"
-        nfo_path = folder / nfo_filename
+        # Movie
+        year_str = str(year) if year else ""
+        nfo_path = target_folder / f"{title} ({year_str}).nfo"
 
-        if nfo_path.exists():
-            return
-
-        nfo_content = '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
-        nfo_content += "<movie>\n"
-        nfo_content += f"  <title>{title}</title>\n"
+        nfo_content = "\n"
+        nfo_content += "\n"
+        nfo_content += f"  {title}\n"
         if year:
-            nfo_content += f"  <year>{year}</year>\n"
+            nfo_content += f"  {year}\n"
         if release_date or year:
             date_to_use = release_date or f"{year}-01-01"
-            nfo_content += f"  <releasedate>{date_to_use}</releasedate>\n"
-            nfo_content += f"  <premiered>{date_to_use}</premiered>\n"
-        nfo_content += "</movie>\n"
+            nfo_content += f"  {date_to_use}\n"
+            nfo_content += f"  {date_to_use}\n"
+        nfo_content += "\n"
 
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        with open(nfo_path, "w", encoding="utf-8") as f:
-            f.write(nfo_content)
-            f.flush()
-            os.fsync(f.fileno())
-        fsync_dir(folder)
-        logger.info(f"[NFO] Created NFO: {nfo_path}")
-    except Exception as e:
-        logger.error(f"[ERROR] Could not create NFO file: {e}")
+        try:
+            with open(nfo_path, "w", encoding="utf-8") as f:
+                f.write(nfo_content)
+            logger.info(f"[NFO] Created movie NFO: {nfo_path}")
+        except Exception as e:
+            logger.error(f"[ERROR] Could not create NFO file: {e}")
+
+
+def extract_release_date(info: dict) -> str:
+    """
+    Try to extract release date from guessit info or use current date.
+    """
+    date_val = info.get("date")
+    if date_val:
+        return str(date_val)
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +399,7 @@ def create_nfo_file(
 # ---------------------------------------------------------------------------
 
 class StrmManager:
-    """Create / update / delete .strm files and normalise paths."""
+    """Create/update/delete .strm files and normalize paths."""
 
     @staticmethod
     def normalize_path(path: str | Path) -> str:
@@ -427,7 +419,6 @@ class StrmManager:
                 stats[key] = stats.get(key, 0) + 1
 
         url_text = url.strip()
-
         try:
             existing = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -448,14 +439,9 @@ class StrmManager:
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(url_text)
-                fh.flush()
-                os.fsync(fh.fileno())
-            # Flush the new directory entry to the host
-            fsync_dir(path.parent)
+            path.write_text(url_text, encoding="utf-8")
             bump("written")
-            logger.debug(f"📝 Written: {path}")
+            logger.debug(f"📝 {path}")
             return True
         except OSError as exc:
             bump("errors")
@@ -464,63 +450,74 @@ class StrmManager:
 
     @staticmethod
     def delete_strm(path: Path, dry_run: bool = False) -> bool:
-        """
-        Delete a single .strm file.
-        After deletion the parent directory is inspected:
-          • if it still has .strm files  → leave it alone
-          • if it has only .nfo files    → purge everything and rmdir
-          • if it is empty               → rmdir
-        Every change is fsynced so it is immediately visible on the host.
-        """
         if dry_run:
-            logger.info(f"🗑️  (dry-run) would delete {path}")
+            logger.info(f"🗑️ (dry-run) {path}")
             return True
 
-        if not force_delete_file(path):
+        try:
+            path.unlink()
+            logger.info(f"🗑️ Deleted {path}")
+            
+            # Clean up parent folder if it only contains .nfo files or is empty
+            parent = path.parent
+            try:
+                items = list(parent.iterdir())
+
+                # If only NFO files remain, delete them as orphaned metadata
+                only_nfo_left = (
+                    len(items) > 0
+                    and all(i.is_file() and i.suffix.lower() == ".nfo" for i in items)
+                )
+                if only_nfo_left:
+                    for i in items:
+                        logger.info(f"🗑️ Deleting orphaned NFO: {i}")
+                        i.unlink()
+                    items = []
+
+                # If folder is now empty, remove it
+                # Note: We only remove the immediate parent here.
+                # The full recursive cleanup happens in _cleanup_empty_folders()
+                if not items:
+                    parent.rmdir()
+                    logger.debug(f"📂 Removed empty folder: {parent}")
+
+            except OSError:
+                # ignore if we can't inspect or remove
+                pass
+
+            return True
+        except OSError as exc:
+            logger.error(f"❌ Cannot delete {path}: {exc}")
             return False
 
-        parent = path.parent
-
-        # Re-check what remains in the parent after the deletion
-        try:
-            remaining = list(parent.iterdir())
-        except OSError:
-            return True
-
-        # Check if any .strm files still exist in this folder
-        remaining_strm = [f for f in remaining if f.suffix.lower() == ".strm"]
-
-        if remaining_strm:
-            # Other episodes / files still here – nothing more to do
-            return True
-
-        # No .strm left → purge the whole parent directory (catches .nfo leftovers)
-        # For TV shows this is a Season XX folder; for movies it is the title folder.
-        purge_dir_if_stale(parent)
-
-        # For TV shows: also check the show root (parent of Season XX)
-        # If all seasons are gone the show folder itself should be removed too.
-        grandparent = parent.parent
-        if grandparent.is_dir() and grandparent != path.parents[2]:
-            purge_dir_if_stale(grandparent)
-
-        return True
-
 
 # ---------------------------------------------------------------------------
-# Mapping Debrid files → Jellyfin paths
+# Mapping Debrid files → Jellyfin paths (logic from rename_and_symlink)
 # ---------------------------------------------------------------------------
 
-def map_dbd_file_to_target(
-    file: DbdFile, dest_base: Path
-) -> tuple[Path, str, Dict[str, Any]]:
+def map_dbd_file_to_target(file: DbdFile, dest_base: Path) -> tuple[Path, str, Dict[str, Any]]:
     """
     Convert a Debrid file into (target_folder, target_basename, meta).
-    target_basename is without extension; .strm will be appended by the caller.
+    target_basename is without extension; .strm will be added.
     """
+    # Use logical path inside Debrid-Link
     filename = Path(file.path).name or file.name
     cleaned_name = clean_filename(filename)
+    # Guessit does not consistently recognize the spaced "S01 EP15" form.
+    cleaned_name = re.sub(
+        r'(?i)\bS(\d{1,2})[ ._-]*(?:EP|E)[ ._-]*(\d{1,3})\b',
+        lambda match: f"S{int(match.group(1)):02}E{int(match.group(2)):02}",
+        cleaned_name,
+    )
     info = guessit(cleaned_name)
+    fallback = _episode_fallback(cleaned_name)
+    if fallback["type"] == "episode":
+        # Prefer parser data where present; fill gaps and identify episodes if
+        # guessit classified the otherwise recognizable episode name differently.
+        info["type"] = "episode"
+        for key in ("title", "year", "season", "episode"):
+            if not info.get(key):
+                info[key] = fallback[key]
 
     release_date = extract_release_date(info)
 
@@ -543,9 +540,12 @@ def map_dbd_file_to_target(
         return target_folder, target_name, meta
 
     if info.get("type") == "episode":
+        # Derive show title:
+        # if path has a parent folder, use its name (cleaned), otherwise guessit title
         parent_name = Path(file.path).parent.name
         if parent_name:
             title = clean_filename(parent_name)
+            # remove common patterns like "S01 - EP(01-09)" and "(2023)"
             title = re.sub(r"\s*S\d{2}\s*-\s*EP\([^)]+\).*$", "", title, flags=re.IGNORECASE)
             title = re.sub(r"\s*\(\d{4}\).*$", "", title)
             title = title.strip()
@@ -558,10 +558,11 @@ def map_dbd_file_to_target(
         season = info.get("season")
         episode = info.get("episode")
 
-        if isinstance(season, list) and season:
+        # Normalize season/episode
+        if isinstance(season, List) and season:
             season = season[0]
 
-        if isinstance(episode, list) and episode:
+        if isinstance(episode, List) and episode:
             episode_list = episode
         elif isinstance(episode, int):
             episode_list = [episode]
@@ -584,6 +585,7 @@ def map_dbd_file_to_target(
         }
         return target_folder, target_name, meta
 
+    # Other media types can be skipped
     raise SkipFile(f"Unsupported media type for: {filename}")
 
 
@@ -673,6 +675,7 @@ class DbdStrmGenerator:
                 logger.warning(f"⚠️ No URL for {f.name}")
                 continue
 
+            # Write/update .strm with Debrid-Link URL
             self.strm_manager.save_strm(
                 full_path,
                 f.url,
@@ -681,23 +684,22 @@ class DbdStrmGenerator:
             )
 
             # Create NFO (movie or episode)
-            if not self.dry_run:
-                if meta["type"] == "movie":
-                    create_nfo_file(
-                        target_folder,
-                        meta["title"],
-                        year=meta["year"],
-                        release_date=meta["release_date"],
-                    )
-                elif meta["type"] == "episode":
-                    create_nfo_file(
-                        target_folder,
-                        meta["title"],
-                        year=meta["year"],
-                        season=meta["season"],
-                        episode_list=meta["episode_list"],
-                        release_date=meta["release_date"],
-                    )
+            if meta["type"] == "movie":
+                create_nfo_file(
+                    target_folder,
+                    meta["title"],
+                    year=meta["year"],
+                    release_date=meta["release_date"],
+                )
+            elif meta["type"] == "episode":
+                create_nfo_file(
+                    target_folder,
+                    meta["title"],
+                    year=meta["year"],
+                    season=meta["season"],
+                    episode_list=meta["episode_list"],
+                    release_date=meta["release_date"],
+                )
 
             normalized_to_actual[key] = rel_path
             normalized_created.add(norm_full)
@@ -735,87 +737,138 @@ class DbdStrmGenerator:
             key = self.strm_manager.normalize_path(rel)
             if key in keep_normalized:
                 kept += 1
-                logger.debug(f"✅ Kept: {rel}")
+                logger.debug(f"Kept: {rel}")
             else:
                 to_delete.append(path)
-                logger.debug(f"🗑️  To delete: {rel}")
+                logger.debug(f"To delete: {rel}")
 
         logger.info(f"📊 {kept} files kept, {len(to_delete)} to delete")
 
         for path in to_delete:
             self.strm_manager.delete_strm(path, self.dry_run)
 
-        # Final pass: purge any directory under movies/ or tvshows/ that has
-        # no .strm files left (catches stubborn .nfo-only or empty folders).
+        # Clean up orphaned folders after all deletions
         if not self.dry_run:
-            self._final_purge_stale_dirs()
+            self._cleanup_empty_folders()
 
-    def _final_purge_stale_dirs(self) -> None:
+    def _cleanup_empty_folders(self) -> None:
         """
-        Walk every immediate child of movies/ and tvshows/.
-        Any subtree that contains zero .strm files is completely removed and
-        every removal is fsynced so it is instantly visible on the host.
+        Recursively remove empty folders in the base directory.
+        Also removes folders that only contain .nfo files (orphaned metadata).
         """
-        logger.info("🔍 Final pass: purging stale directories…")
-
-        for media_root in ["movies", "tvshows"]:
-            media_dir = self.base_dir / media_root
-            if not media_dir.is_dir():
+        logger.info("🔍 Cleaning up empty and orphaned folders…")
+        
+        # Process both movies and tvshows directories
+        for media_type in ["movies", "tvshows"]:
+            media_dir = self.base_dir / media_type
+            if not media_dir.exists():
                 continue
+            
+            self._cleanup_folder_recursive(media_dir)
 
-            # For movies: children are title folders  (movies/<Title (Year)>/)
-            # For tvshows: children are show folders  (tvshows/<Show>/)
-            #              grandchildren are season folders
-            # We check at the show/title level so the whole tree is removed
-            # in one shot when nothing is left.
-            for child in sorted(media_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                strm_count = len(list(child.rglob("*.strm")))
-                if strm_count == 0:
-                    logger.info(
-                        f"🧹 No .strm files left under '{child.name}' – removing entire tree"
-                    )
-                    force_delete_dir(child)
+    def _cleanup_folder_recursive(self, folder: Path) -> bool:
+        """
+        Recursively clean up a folder and its subfolders.
+        Returns True if the folder should be deleted (is empty or only has orphaned files).
+        """
+        if not folder.is_dir():
+            return False
+        
+        try:
+            items = list(folder.iterdir())
+        except OSError as e:
+            logger.warning(f"⚠️ Cannot read directory {folder}: {e}")
+            return False
+        
+        if not items:
+            # Folder is already empty
+            try:
+                folder.rmdir()
+                logger.info(f"🗑️ Removed empty folder: {folder}")
+                return True
+            except OSError as e:
+                logger.warning(f"⚠️ Cannot remove empty folder {folder}: {e}")
+                return False
+        
+        # First, recursively process subfolders
+        subfolders_to_check = [item for item in items if item.is_dir()]
+        for subfolder in subfolders_to_check:
+            self._cleanup_folder_recursive(subfolder)
+        
+        # Re-check items after recursive cleanup
+        try:
+            items = list(folder.iterdir())
+        except OSError:
+            return False
+        
+        if not items:
+            # Folder became empty after recursive cleanup
+            try:
+                folder.rmdir()
+                logger.info(f"🗑️ Removed empty folder: {folder}")
+                return True
+            except OSError as e:
+                logger.warning(f"⚠️ Cannot remove empty folder {folder}: {e}")
+                return False
+        
+        # Check if only .nfo files remain (orphaned metadata)
+        only_nfo = all(item.is_file() and item.suffix.lower() == ".nfo" for item in items)
+        
+        if only_nfo:
+            logger.info(f"🗑️ Found folder with only orphaned .nfo files: {folder}")
+            for item in items:
+                try:
+                    item.unlink()
+                    logger.info(f"🗑️ Deleted orphaned NFO: {item}")
+                except OSError as e:
+                    logger.warning(f"⚠️ Cannot delete {item}: {e}")
+            
+            # Try to remove the folder after deleting .nfo files
+            try:
+                folder.rmdir()
+                logger.info(f"🗑️ Removed folder after cleaning orphaned metadata: {folder}")
+                return True
+            except OSError as e:
+                logger.warning(f"⚠️ Cannot remove folder {folder}: {e}")
+                return False
+        
+        return False
 
-            # After children are processed, fsync the media root itself
-            fsync_dir(media_dir)
+    async def run(self, per_page: int = 100, oldest_first: bool = False) -> None:
+        if not await self.verify_connection():
+            raise DbdAPIError("Cannot connect to seedbox, aborting.")
+
+        files = await self.fetch_files(per_page=per_page, oldest_first=oldest_first)
+
+        if not files:
+            logger.warning("⚠️ No files retrieved from Debrid-Link.")
+            # No files = we should remove ALL existing .strm files
+            keep_normalized: Set[str] = set()
+        else:
+            keep_normalized = await self.generate_strm_files(files)
+
+        # Always run cleanup; if keep_normalized is empty, this deletes all .strm
+        await self.cleanup_old_strm_files(keep_normalized)
+
+        logger.info("✅ Done")
 
 
 # ---------------------------------------------------------------------------
-# Single run
+# Async one-shot runner
 # ---------------------------------------------------------------------------
 
-async def run_once(target: Path, args: argparse.Namespace) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-
-    async with httpx.AsyncClient(timeout=30) as client:
+async def run_once(target: Path, args) -> None:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         api = DbdAPI(API_KEY, API_URL, client)
-        generator = DbdStrmGenerator(
+        app = DbdStrmGenerator(
             api=api,
             base_dir=target,
             sdbx_id=SDBX_ID,
             min_size=args.min_size,
             dry_run=args.dry_run,
         )
+        await app.run(per_page=args.per_page, oldest_first=args.oldest)
 
-        logger.info(f"📁 Output directory : {target}")
-        logger.info(f"🔑 API URL          : {API_URL}")
-
-        files = await generator.fetch_files(
-            per_page=args.per_page,
-            oldest_first=args.oldest,
-        )
-
-        keep = await generator.generate_strm_files(files)
-        await generator.cleanup_old_strm_files(keep)
-
-    logger.info("✅ Done.")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 async def amain() -> None:
     parser = argparse.ArgumentParser(
@@ -824,17 +877,20 @@ async def amain() -> None:
     )
 
     parser.add_argument(
-        "-d", "--dry-run",
+        "-d",
+        "--dry-run",
         action="store_true",
         help="Simulate operations without writing/deleting files",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose mode",
     )
     parser.add_argument(
-        "-m", "--min-size",
+        "-m",
+        "--min-size",
         type=int,
         default=DEFAULT_MIN_SIZE,
         help="Minimum file size in bytes",
@@ -896,11 +952,18 @@ def main() -> None:
             logger.warning("\n⚠️ Interrupted")
             sys.exit(130)
 
+        # If interval <= 0, run once and exit
         if RESCAN_INTERVAL_MIN <= 0:
             break
 
-        logger.info(f"⏳ Next scan in {RESCAN_INTERVAL_MIN} minutes…")
-        time.sleep(RESCAN_INTERVAL_MIN * 60)
+        logger.info(
+            f"⏲️ Sleeping {RESCAN_INTERVAL_MIN} minutes before next scan..."
+        )
+        try:
+            time.sleep(RESCAN_INTERVAL_MIN * 60)
+        except KeyboardInterrupt:
+            logger.warning("\n⚠️ Interrupted during sleep")
+            sys.exit(130)
 
 
 if __name__ == "__main__":
